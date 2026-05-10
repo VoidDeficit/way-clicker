@@ -362,6 +362,7 @@ class WayClickerApp:
         self._hotkeys = HotkeyListener()
         self._running = False
         self._ready = False
+        self._delay_id = None
 
         # Current hotkey bindings (pynput format)
         self._key_toggle = DEFAULT_KEY_TOGGLE
@@ -467,11 +468,26 @@ class WayClickerApp:
             lambda: self._change_key("stop"),
         )
 
+        # Start delay (button only)
+        self._section("Start Delay  (button only)", root)
+        sdfr = tk.Frame(root, bg=COLOR_BG)
+        sdfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._delay_var = tk.StringVar(value="3")
+        tk.Spinbox(
+            sdfr, from_=0, to=99, textvariable=self._delay_var,
+            width=4, bg=COLOR_SURFACE, fg=COLOR_TEXT,
+            buttonbackground=COLOR_SURFACE, relief="flat",
+            highlightbackground=COLOR_BORDER, highlightthickness=1,
+            font=("Mono", 11),
+        ).pack(side="left")
+        tk.Label(sdfr, text="seconds", bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=("Sans", 10)).pack(side="left", padx=(6, 0))
+
         # Control button
         cfr2 = tk.Frame(root, bg=COLOR_BG)
         cfr2.pack(padx=12, pady=10, fill="x")
         self._start_btn = tk.Button(
-            cfr2, text=self._start_btn_label(), command=self._toggle,
+            cfr2, text=self._start_btn_label(), command=self._toggle_btn,
             bg=COLOR_START, fg="white",
             activebackground=COLOR_START_HOVER, activeforeground="white",
             font=("Sans", 12, "bold"), relief="flat", bd=0,
@@ -588,6 +604,12 @@ class WayClickerApp:
                  v(self._millis))
         return max(1, total)
 
+    def _get_delay_ms(self) -> int:
+        try:
+            return max(0, int(self._delay_var.get())) * 1000
+        except ValueError:
+            return 0
+
     def _get_jitter_ms(self) -> int:
         try:
             return max(0, int(self._jitter._var.get()))
@@ -623,11 +645,50 @@ class WayClickerApp:
 
     # ──────────────────────────────────────────────── clicker
 
-    def _toggle(self):
+    def _toggle_btn(self):
+        """Called by the Start/Stop button — applies start delay."""
         if self._running:
             self._stop()
+        elif self._delay_id is not None:
+            self._cancel_delay()
+        elif self._ready:
+            delay = self._get_delay_ms()
+            if delay > 0:
+                self._start_delayed(delay)
+            else:
+                self._start()
+
+    def _toggle(self):
+        """Called by hotkey — no delay."""
+        if self._running:
+            self._stop()
+        elif self._delay_id is not None:
+            self._cancel_delay()
         elif self._ready:
             self._start()
+
+    def _start_delayed(self, remaining_ms: int):
+        secs = (remaining_ms + 999) // 1000
+        self._status_label.config(text=f"● Starting in {secs}s…", fg=COLOR_WARN)
+        self._start_btn.config(
+            text=f"Cancel ({secs}s…)", bg=COLOR_WARN,
+            activebackground=COLOR_WARN)
+        if remaining_ms <= 0:
+            self._delay_id = None
+            self._start_btn.config(bg=COLOR_START, activebackground=COLOR_START_HOVER)
+            self._start()
+            return
+        self._delay_id = self.root.after(
+            100, self._start_delayed, remaining_ms - 100)
+
+    def _cancel_delay(self):
+        if self._delay_id is not None:
+            self.root.after_cancel(self._delay_id)
+            self._delay_id = None
+        self._status_label.config(text="● Ready", fg=COLOR_MUTED)
+        self._start_btn.config(
+            text=self._start_btn_label(),
+            bg=COLOR_START, activebackground=COLOR_START_HOVER)
 
     def _start(self):
         if self._running:
@@ -643,6 +704,9 @@ class WayClickerApp:
         )
 
     def _stop(self):
+        if self._delay_id is not None:
+            self._cancel_delay()
+            return
         self._engine.stop()
 
     def _on_tick(self, count: int):
@@ -672,6 +736,7 @@ class WayClickerApp:
         self._seconds._var.set(str(s.get("seconds", 0)))
         self._millis._var.set(str(s.get("millis", 100)))
         self._jitter._var.set(str(s.get("jitter", 0)))
+        self._delay_var.set(str(s.get("delay_sec", 3)))
         self._button_var.set(s.get("button", "Left"))
         self._infinite_var.set(s.get("infinite", True))
         self._count_var.set(str(s.get("count", 10)))
@@ -689,6 +754,7 @@ class WayClickerApp:
             "seconds": self._seconds._var.get(),
             "millis": self._millis._var.get(),
             "jitter": self._jitter._var.get(),
+            "delay_sec": self._delay_var.get(),
             "button": self._button_var.get(),
             "infinite": self._infinite_var.get(),
             "count": self._count_var.get(),
