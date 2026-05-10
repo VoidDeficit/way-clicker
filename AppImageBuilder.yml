@@ -34,7 +34,7 @@ AppDir:
     icon: way-clicker
     version: !ENV '${APP_VERSION}'
     exec: usr/bin/python3
-    exec_args: usr/local/lib/way-clicker/main.py $@
+    exec_args: $APPDIR/usr/local/lib/way-clicker/main.py $@
 
   apt:
     arch: amd64
