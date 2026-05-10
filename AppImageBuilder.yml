@@ -7,6 +7,17 @@ script:
   - cp main.py AppDir/usr/local/lib/way-clicker/main.py
   # install pynput into the AppDir's Python path
   - pip3 install --target AppDir/usr/lib/python3/dist-packages pynput
+  # launcher wrapper — sets TCL/TK library paths before starting Python
+  - mkdir -p AppDir/usr/bin
+  - |
+    cat > AppDir/usr/bin/way-clicker << 'LAUNCHER'
+    #!/bin/bash
+    export TCL_LIBRARY="${APPDIR}/usr/share/tcltk/tcl8.6"
+    export TK_LIBRARY="${APPDIR}/usr/share/tcltk/tk8.6"
+    export TKPATH="${TK_LIBRARY}"
+    exec "${APPDIR}/usr/bin/python3" "${APPDIR}/usr/local/lib/way-clicker/main.py" "$@"
+    LAUNCHER
+  - chmod +x AppDir/usr/bin/way-clicker
   # icon (scalable + 256px raster for launchers that need PNG)
   - mkdir -p AppDir/usr/share/icons/hicolor/scalable/apps
   - mkdir -p AppDir/usr/share/icons/hicolor/256x256/apps
@@ -33,8 +44,8 @@ AppDir:
     name: Way Clicker
     icon: way-clicker
     version: !ENV '${APP_VERSION}'
-    exec: usr/bin/python3
-    exec_args: $APPDIR/usr/local/lib/way-clicker/main.py $@
+    exec: usr/bin/way-clicker
+    exec_args: $@
 
   apt:
     arch: amd64
@@ -49,6 +60,8 @@ AppDir:
       - gir1.2-glib-2.0
       - libdbus-1-3
       - libglib2.0-0
+      - tcl8.6        # provides /usr/share/tcltk/tcl8.6/init.tcl
+      - tk8.6         # provides /usr/share/tcltk/tk8.6/
 
     exclude:
       - perl
