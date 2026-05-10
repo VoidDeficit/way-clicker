@@ -15,7 +15,7 @@ script:
   # desktop entry
   - mkdir -p AppDir/usr/share/applications
   - |
-    cat > AppDir/usr/share/applications/way-clicker.desktop << 'EOF'
+    cat > AppDir/usr/share/applications/io.github.way-clicker.desktop << 'EOF'
     [Desktop Entry]
     Name=Way Clicker
     Comment=Wayland auto clicker
@@ -32,7 +32,7 @@ AppDir:
     id: io.github.way-clicker
     name: Way Clicker
     icon: way-clicker
-    version: !ENV '${APP_VERSION:-dev}'
+    version: !ENV '${APP_VERSION}'
     exec: usr/bin/python3
     exec_args: usr/local/lib/way-clicker/main.py $@
 

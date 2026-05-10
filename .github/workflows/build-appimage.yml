@@ -46,7 +46,7 @@ jobs:
 
       - name: Build AppImage
         env:
-          APP_VERSION: ${{ steps.ver.outputs.version }}
+          APP_VERSION: ${{ steps.ver.outputs.version || 'dev' }}
         run: appimage-builder --recipe AppImageBuilder.yml --skip-test
 
       - name: Rename artifact
