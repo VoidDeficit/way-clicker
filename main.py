@@ -31,10 +31,12 @@ except ImportError:
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
 PORTAL_RD = "org.freedesktop.portal.RemoteDesktop"
+PORTAL_SC = "org.freedesktop.portal.ScreenCast"
 PORTAL_REQ = "org.freedesktop.portal.Request"
 PORTAL_SESSION = "org.freedesktop.portal.Session"
 
 DEVICE_POINTER = 2  # bitmask: keyboard=1, pointer=2, touchscreen=4
+SC_SOURCE_MONITOR = 1
 
 BTN = {"Left": 0x110, "Middle": 0x112, "Right": 0x111}
 
@@ -118,8 +120,11 @@ class PortalBackend:
 
         portal_obj = self._bus.get_object(PORTAL_BUS, PORTAL_PATH)
         self._iface = dbus.Interface(portal_obj, PORTAL_RD)
+        self._sc_iface = dbus.Interface(portal_obj, PORTAL_SC)
 
         self._session_handle: str | None = None
+        # Each entry: (node_id, origin_x, origin_y, width, height)
+        self._streams: list[tuple[int, int, int, int, int]] = []
         self._ready = threading.Event()
         self._counter = 0
         self._sender = self._bus.get_unique_name()[1:].replace(".", "_")
@@ -168,6 +173,23 @@ class PortalBackend:
             self._on_deny("Session creation was cancelled.")
             return
         self._session_handle = str(results["session_handle"])
+        # Configure ScreenCast sources on the same session before selecting devices
+        self._sc_select_sources()
+
+    def _sc_select_sources(self):
+        req_tok = self._token()
+        self._on_response(req_tok, self._cb_sc_select)
+        self._sc_iface.SelectSources(
+            dbus.ObjectPath(self._session_handle),
+            dbus.Dictionary({
+                "handle_token": dbus.String(req_tok),
+                "types": dbus.UInt32(SC_SOURCE_MONITOR),
+                "multiple": dbus.Boolean(True),
+            }, signature="sv"),
+        )
+
+    def _cb_sc_select(self, response: int, results: dict):
+        # Whether the user granted screen capture or not, proceed to select devices
         self._select_devices()
 
     def _select_devices(self):
@@ -201,12 +223,70 @@ class PortalBackend:
         if response != 0:
             self._on_deny("Permission denied by user.")
             return
+        # Extract ScreenCast streams from the combined session result
+        if "streams" in results:
+            for node_id, props in results["streams"]:
+                pos = props.get("position", (0, 0))
+                size = props.get("size", (0, 0))
+                self._streams.append((
+                    int(node_id),
+                    int(pos[0]), int(pos[1]),
+                    int(size[0]), int(size[1]),
+                ))
+                print(f"[way-clicker] stream node={int(node_id)} "
+                      f"pos=({int(pos[0])},{int(pos[1])}) "
+                      f"size=({int(size[0])}x{int(size[1])})", flush=True)
         self._ready.set()
         self._on_ready()
 
-    def click(self, button_label: str) -> bool:
+    @property
+    def has_abs_position(self) -> bool:
+        return bool(self._streams)
+
+    def _stream_for(self, x: int, y: int) -> tuple[int, float, float] | tuple[None, float, float]:
+        """Return (node_id, rel_x, rel_y) for the stream covering (x, y)."""
+        for node_id, sx, sy, sw, sh in self._streams:
+            if sx <= x < sx + sw and sy <= y < sy + sh:
+                return node_id, float(x - sx), float(y - sy)
+        # Fallback: clamp to first stream
+        if self._streams:
+            node_id, sx, sy, sw, sh = self._streams[0]
+            return node_id, float(max(0, min(x - sx, sw - 1))), float(max(0, min(y - sy, sh - 1)))
+        return None, 0.0, 0.0
+
+    def move_mouse(self, x: int, y: int) -> bool:
+        node_id, rx, ry = self._stream_for(x, y)
+        if node_id is None or self._session_handle is None:
+            return False
+
+        done = threading.Event()
+        result: dict = {"ok": False}
+
+        def _do_move():
+            opts = dbus.Dictionary({}, signature="sv")
+            sess = dbus.ObjectPath(self._session_handle)
+            try:
+                self._iface.NotifyPointerMotionAbsolute(
+                    sess, opts,
+                    dbus.UInt32(node_id),
+                    dbus.Double(rx), dbus.Double(ry),
+                )
+                result["ok"] = True
+            except Exception as ex:
+                print(f"[way-clicker] move error: {ex}", flush=True)
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(_do_move)
+        done.wait(timeout=2.0)
+        return result["ok"]
+
+    def click(self, button_label: str, pos: tuple[int, int] | None = None) -> bool:
         if not self._ready.is_set() or self._session_handle is None:
             return False
+        if pos is not None:
+            self.move_mouse(pos[0], pos[1])
         btn = BTN.get(button_label, BTN["Left"])
         result: dict = {"ok": False}
         done = threading.Event()
@@ -251,18 +331,21 @@ class ClickerEngine:
 
     def start(self, interval_ms: int, button_label: str,
               max_clicks: int, on_tick, on_done,
-              jitter_ms: int = 0):
+              jitter_ms: int = 0,
+              fixed_pos: tuple[int, int] | None = None):
         self._stop_event.clear()
         threading.Thread(
             target=self._loop,
-            args=(interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done),
+            args=(interval_ms, jitter_ms, button_label, max_clicks,
+                  fixed_pos, on_tick, on_done),
             daemon=True,
         ).start()
 
     def stop(self):
         self._stop_event.set()
 
-    def _loop(self, interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done):
+    def _loop(self, interval_ms, jitter_ms, button_label, max_clicks,
+              fixed_pos, on_tick, on_done):
         interval = interval_ms / 1000.0
         jitter = jitter_ms / 1000.0
         count = 0
@@ -270,7 +353,7 @@ class ClickerEngine:
         consecutive_errors = 0
 
         while not self._stop_event.is_set():
-            if self._backend.click(button_label):
+            if self._backend.click(button_label, pos=fixed_pos):
                 consecutive_errors = 0
                 count += 1
                 on_tick(count)
@@ -468,6 +551,34 @@ class WayClickerApp:
         )
         self._count_spin.pack(side="left", padx=4)
 
+        # Fixed click position
+        self._section("Click Position", root)
+        pfr = tk.Frame(root, bg=COLOR_BG)
+        pfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._fixed_pos_var = tk.BooleanVar(value=False)
+        self._fixed_pos_cb = tk.Checkbutton(
+            pfr, text="Fixed position",
+            variable=self._fixed_pos_var, command=self._on_fixed_pos_toggle,
+            bg=COLOR_BG, fg=COLOR_MUTED, selectcolor=COLOR_SURFACE,
+            activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
+            font=("Sans", 10), state="disabled",
+        )
+        self._fixed_pos_cb.pack(side="left")
+        xyfr = tk.Frame(pfr, bg=COLOR_BG)
+        xyfr.pack(side="left", padx=(16, 0))
+        self._fixed_x = self._spinbox(xyfr, "X", 0, 99999, default=0)
+        self._fixed_x.pack(side="left", padx=4)
+        self._fixed_y = self._spinbox(xyfr, "Y", 0, 99999, default=0)
+        self._fixed_y.pack(side="left", padx=4)
+        self._pick_btn = tk.Button(
+            xyfr, text="Pick", command=self._pick_position,
+            bg=COLOR_SURFACE, fg=COLOR_MUTED,
+            activebackground=COLOR_BORDER, activeforeground=COLOR_TEXT,
+            font=("Sans", 9), relief="flat", padx=8, pady=2, cursor="hand2",
+        )
+        self._pick_btn.pack(side="left", padx=(8, 0))
+        self._on_fixed_pos_toggle()
+
         # Hotkeys
         self._section("Hotkeys", root)
         hkf = tk.Frame(root, bg=COLOR_BG)
@@ -620,6 +731,16 @@ class WayClickerApp:
         self._ready = True
         self._status_label.config(text="● Ready", fg=COLOR_START)
         self._start_btn.config(state="normal")
+        if self._backend.has_abs_position:
+            self._fixed_pos_cb.config(
+                state="normal", fg=COLOR_TEXT,
+                activeforeground=COLOR_TEXT,
+            )
+        else:
+            self._fixed_pos_cb.config(
+                text="Fixed position  (allow screen capture to enable)",
+                fg=COLOR_MUTED,
+            )
 
     def _portal_denied_ui(self, reason: str):
         self._status_label.config(text=f"● {reason}", fg=COLOR_STOP)
@@ -662,6 +783,62 @@ class WayClickerApp:
     def _on_infinite_toggle(self):
         state = "disabled" if self._infinite_var.get() else "normal"
         self._count_spin.config(state=state)
+
+    def _get_fixed_pos(self) -> tuple[int, int] | None:
+        if not self._fixed_pos_var.get() or not self._backend.has_abs_position:
+            return None
+        try:
+            return (max(0, int(self._fixed_x._var.get())),
+                    max(0, int(self._fixed_y._var.get())))
+        except ValueError:
+            return None
+
+    def _on_fixed_pos_toggle(self):
+        on = self._fixed_pos_var.get() and self._backend.has_abs_position
+        state = "normal" if on else "disabled"
+        for frame in (self._fixed_x, self._fixed_y):
+            for child in frame.winfo_children():
+                try:
+                    child.config(state=state)
+                except tk.TclError:
+                    pass
+        self._pick_btn.config(state=state)
+
+    def _pick_position(self):
+        if not HAS_PYNPUT:
+            return
+        self._pick_btn.config(state="disabled", text="…press a key")
+        self._status_label.config(
+            text="● Move cursor to target, then press any key…", fg=COLOR_WARN)
+        self._hotkeys.stop()
+
+        from pynput.mouse import Controller as MouseCtrl
+        from pynput import keyboard as kb
+
+        def on_press(_):
+            try:
+                x, y = MouseCtrl().position
+                self.root.after(0, lambda: self._set_picked_pos(int(x), int(y)))
+            except Exception as ex:
+                print(f"[way-clicker] pick error: {ex}", flush=True)
+                self.root.after(0, self._pick_done)
+            return False
+
+        listener = kb.Listener(on_press=on_press)
+        listener.daemon = True
+        listener.start()
+
+    def _set_picked_pos(self, x: int, y: int):
+        self._fixed_x._var.set(str(x))
+        self._fixed_y._var.set(str(y))
+        self._pick_done()
+
+    def _pick_done(self):
+        self._pick_btn.config(state="normal", text="Pick")
+        self._status_label.config(
+            text="● Ready" if self._ready else "● Waiting for permission…",
+            fg=COLOR_START if self._ready else COLOR_INFO)
+        self._apply_hotkeys()
 
     def _set_running(self, running: bool):
         self._running = running
@@ -736,6 +913,7 @@ class WayClickerApp:
             on_tick=self._on_tick,
             on_done=self._on_done,
             jitter_ms=self._get_jitter_ms(),
+            fixed_pos=self._get_fixed_pos(),
         )
 
     def _stop(self):
@@ -773,6 +951,9 @@ class WayClickerApp:
         self._infinite_var.set(s.get("infinite", True))
         self._count_var.set(str(s.get("count", 10)))
         self._on_infinite_toggle()
+        self._fixed_pos_var.set(s.get("fixed", False))
+        self._fixed_x._var.set(str(s.get("fixed_x", 0)))
+        self._fixed_y._var.set(str(s.get("fixed_y", 0)))
         self._key_toggle = s.get("key_toggle", DEFAULT_KEY_TOGGLE)
         self._key_stop = s.get("key_stop", DEFAULT_KEY_STOP)
         self._toggle_key_lbl.config(text=pynput_to_display(self._key_toggle))
@@ -790,6 +971,9 @@ class WayClickerApp:
             "button": self._button_var.get(),
             "infinite": self._infinite_var.get(),
             "count": self._count_var.get(),
+            "fixed": self._fixed_pos_var.get(),
+            "fixed_x": self._fixed_x._var.get(),
+            "fixed_y": self._fixed_y._var.get(),
             "key_toggle": self._key_toggle,
             "key_stop": self._key_stop,
         }
