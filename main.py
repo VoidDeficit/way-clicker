@@ -204,10 +204,43 @@ class PortalBackend:
         self._ready.set()
         self._on_ready()
 
+    def move_mouse(self, x: int, y: int) -> bool:
+        """Move mouse to absolute coordinates using relative portal motion + pynput for current pos."""
+        if not self._ready.is_set() or self._session_handle is None:
+            return False
+        try:
+            from pynput.mouse import Controller as MouseCtrl
+            cx, cy = MouseCtrl().position
+            dx, dy = float(x - cx), float(y - cy)
+        except Exception as ex:
+            print(f"[way-clicker] could not read cursor position: {ex}", flush=True)
+            return False
+
+        done = threading.Event()
+        result: dict = {"ok": False}
+
+        def _do_move():
+            opts = dbus.Dictionary({}, signature="sv")
+            sess = dbus.ObjectPath(self._session_handle)
+            try:
+                self._iface.NotifyPointerMotion(sess, opts, dbus.Double(dx), dbus.Double(dy))
+                result["ok"] = True
+            except Exception as ex:
+                print(f"[way-clicker] move error: {ex}", flush=True)
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(_do_move)
+        done.wait(timeout=2.0)
+        return result["ok"]
+
     def click(self, button_label: str,
               pos: tuple[int, int] | None = None) -> bool:
         if not self._ready.is_set() or self._session_handle is None:
             return False
+        if pos is not None:
+            self.move_mouse(pos[0], pos[1])
         btn = BTN.get(button_label, BTN["Left"])
         result: dict = {"ok": False}
         done = threading.Event()
@@ -216,11 +249,6 @@ class PortalBackend:
             opts = dbus.Dictionary({}, signature="sv")
             sess = dbus.ObjectPath(self._session_handle)
             try:
-                if pos is not None:
-                    # stream=0 → absolute screen coordinates
-                    self._iface.NotifyPointerMotionAbsolute(
-                        sess, opts, dbus.UInt32(0),
-                        dbus.Double(pos[0]), dbus.Double(pos[1]))
                 self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(1))
                 self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(0))
                 result["ok"] = True
@@ -710,8 +738,8 @@ class WayClickerApp:
 
     def _on_fixed_pos_toggle(self):
         state = "normal" if self._fixed_pos_var.get() else "disabled"
-        for spinbox_frame in (self._fixed_x, self._fixed_y):
-            for child in spinbox_frame.winfo_children():
+        for frame in (self._fixed_x, self._fixed_y):
+            for child in frame.winfo_children():
                 try:
                     child.config(state=state)
                 except tk.TclError:
@@ -719,7 +747,6 @@ class WayClickerApp:
         self._pick_btn.config(state=state)
 
     def _pick_position(self):
-        """Wait for any key press, then capture the current cursor coordinates."""
         if not HAS_PYNPUT:
             return
         self._pick_btn.config(state="disabled", text="…press a key")
@@ -730,14 +757,14 @@ class WayClickerApp:
         from pynput.mouse import Controller as MouseCtrl
         from pynput import keyboard as kb
 
-        def on_press(key):
+        def on_press(_):
             try:
                 x, y = MouseCtrl().position
                 self.root.after(0, lambda: self._set_picked_pos(int(x), int(y)))
             except Exception as ex:
                 print(f"[way-clicker] pick error: {ex}", flush=True)
                 self.root.after(0, self._pick_done)
-            return False  # stop listener after first key
+            return False
 
         listener = kb.Listener(on_press=on_press)
         listener.daemon = True
@@ -750,9 +777,9 @@ class WayClickerApp:
 
     def _pick_done(self):
         self._pick_btn.config(state="normal", text="Pick")
-        ready_text = "● Ready" if self._ready else "● Waiting for permission…"
-        ready_color = COLOR_START if self._ready else COLOR_INFO
-        self._status_label.config(text=ready_text, fg=ready_color)
+        self._status_label.config(
+            text="● Ready" if self._ready else "● Waiting for permission…",
+            fg=COLOR_START if self._ready else COLOR_INFO)
         self._apply_hotkeys()
 
     def _set_running(self, running: bool):
