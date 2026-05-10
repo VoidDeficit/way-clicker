@@ -54,7 +54,7 @@ jobs:
 
       - name: Rename artifact
         run: |
-          mv Way_Clicker*.AppImage "Way-Clicker-x86_64.AppImage" 2>/dev/null || true
+          find . -maxdepth 1 -name "*.AppImage" | head -1 | xargs -I{} mv {} Way-Clicker-x86_64.AppImage
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
