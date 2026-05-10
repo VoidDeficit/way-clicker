@@ -59,6 +59,7 @@ jobs:
       - name: Generate zsync
         run: |
           sudo apt-get install -y --no-install-recommends zsync
+          find . -maxdepth 1 -name "*.zsync" -delete
           zsyncmake Way-Clicker-x86_64.AppImage
 
       - name: Upload artifact
