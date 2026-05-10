@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """Way Clicker — Wayland auto clicker via XDG RemoteDesktop portal."""
 
+import json
+import os
+import random
 import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
+
+CONFIG_PATH = os.path.expanduser("~/.config/way-clicker.json")
 
 import dbus
 from dbus.mainloop.glib import DBusGMainLoop
@@ -225,19 +230,20 @@ class ClickerEngine:
         self._stop_event = threading.Event()
 
     def start(self, interval_ms: int, button_label: str,
-              max_clicks: int, on_tick, on_done):
+              max_clicks: int, on_tick, on_done, jitter_ms: int = 0):
         self._stop_event.clear()
         threading.Thread(
             target=self._loop,
-            args=(interval_ms, button_label, max_clicks, on_tick, on_done),
+            args=(interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done),
             daemon=True,
         ).start()
 
     def stop(self):
         self._stop_event.set()
 
-    def _loop(self, interval_ms, button_label, max_clicks, on_tick, on_done):
+    def _loop(self, interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done):
         interval = interval_ms / 1000.0
+        jitter = jitter_ms / 1000.0
         count = 0
         infinite = max_clicks == 0
         consecutive_errors = 0
@@ -255,7 +261,8 @@ class ClickerEngine:
                     on_done(error=True)
                     return
 
-            deadline = time.monotonic() + interval
+            actual = interval + (random.uniform(-jitter, jitter) if jitter > 0 else 0)
+            deadline = time.monotonic() + max(0.001, actual)
             while time.monotonic() < deadline and not self._stop_event.is_set():
                 time.sleep(0.02)
 
@@ -361,6 +368,7 @@ class WayClickerApp:
         self._key_stop = DEFAULT_KEY_STOP
 
         self._build_ui()
+        self._load_settings()
         self._apply_hotkeys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._init_portal)
@@ -398,6 +406,13 @@ class WayClickerApp:
         self._millis = self._spinbox(ifr, "Ms", 0, 999, default=100)
         for w in ifr.winfo_children():
             w.pack(side="left", padx=4)
+
+        # Jitter
+        self._section("Random Jitter", root)
+        jfr = tk.Frame(root, bg=COLOR_BG)
+        jfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._jitter = self._spinbox(jfr, "± Ms", 0, 9999, default=0)
+        self._jitter.pack(side="left", padx=4)
 
         # Mouse button
         self._section("Mouse Button", root)
@@ -573,6 +588,12 @@ class WayClickerApp:
                  v(self._millis))
         return max(1, total)
 
+    def _get_jitter_ms(self) -> int:
+        try:
+            return max(0, int(self._jitter._var.get()))
+        except ValueError:
+            return 0
+
     def _get_max_clicks(self) -> int:
         if self._infinite_var.get():
             return 0
@@ -618,6 +639,7 @@ class WayClickerApp:
             max_clicks=self._get_max_clicks(),
             on_tick=self._on_tick,
             on_done=self._on_done,
+            jitter_ms=self._get_jitter_ms(),
         )
 
     def _stop(self):
@@ -639,7 +661,49 @@ class WayClickerApp:
                 )
         self.root.after(0, _update)
 
+    def _load_settings(self):
+        try:
+            with open(CONFIG_PATH) as f:
+                s = json.load(f)
+        except Exception:
+            return
+        self._hours._var.set(str(s.get("hours", 0)))
+        self._minutes._var.set(str(s.get("minutes", 0)))
+        self._seconds._var.set(str(s.get("seconds", 0)))
+        self._millis._var.set(str(s.get("millis", 100)))
+        self._jitter._var.set(str(s.get("jitter", 0)))
+        self._button_var.set(s.get("button", "Left"))
+        self._infinite_var.set(s.get("infinite", True))
+        self._count_var.set(str(s.get("count", 10)))
+        self._on_infinite_toggle()
+        self._key_toggle = s.get("key_toggle", DEFAULT_KEY_TOGGLE)
+        self._key_stop = s.get("key_stop", DEFAULT_KEY_STOP)
+        self._toggle_key_lbl.config(text=pynput_to_display(self._key_toggle))
+        self._stop_key_lbl.config(text=pynput_to_display(self._key_stop))
+        self._start_btn.config(text=self._start_btn_label())
+
+    def _save_settings(self):
+        s = {
+            "hours": self._hours._var.get(),
+            "minutes": self._minutes._var.get(),
+            "seconds": self._seconds._var.get(),
+            "millis": self._millis._var.get(),
+            "jitter": self._jitter._var.get(),
+            "button": self._button_var.get(),
+            "infinite": self._infinite_var.get(),
+            "count": self._count_var.get(),
+            "key_toggle": self._key_toggle,
+            "key_stop": self._key_stop,
+        }
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(s, f, indent=2)
+        except Exception as ex:
+            print(f"[way-clicker] could not save settings: {ex}", flush=True)
+
     def _on_close(self):
+        self._save_settings()
         self._engine.cleanup()
         self._hotkeys.stop()
         self.root.destroy()
