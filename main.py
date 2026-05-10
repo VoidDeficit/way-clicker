@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""Way Clicker — Wayland auto clicker via XDG RemoteDesktop portal."""
+
+import threading
+import time
+import tkinter as tk
+from tkinter import messagebox
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+try:
+    from pynput import keyboard as pynput_keyboard
+
+    HAS_PYNPUT = True
+except ImportError:
+    HAS_PYNPUT = False
+
+PORTAL_BUS = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+PORTAL_RD = "org.freedesktop.portal.RemoteDesktop"
+PORTAL_REQ = "org.freedesktop.portal.Request"
+PORTAL_SESSION = "org.freedesktop.portal.Session"
+
+DEVICE_POINTER = 2  # bitmask: keyboard=1, pointer=2, touchscreen=4
+
+BTN = {"Left": 0x110, "Middle": 0x112, "Right": 0x111}
+
+COLOR_START = "#2ecc71"
+COLOR_STOP = "#e74c3c"
+COLOR_START_HOVER = "#27ae60"
+COLOR_STOP_HOVER = "#c0392b"
+COLOR_BG = "#1e1e2e"
+COLOR_SURFACE = "#2a2a3e"
+COLOR_TEXT = "#cdd6f4"
+COLOR_MUTED = "#7f849c"
+COLOR_BORDER = "#45475a"
+COLOR_WARN = "#e5c07b"
+COLOR_INFO = "#89b4fa"
+COLOR_ACCENT = "#cba6f7"
+
+# Default hotkeys in pynput format
+DEFAULT_KEY_TOGGLE = "<f6>"
+DEFAULT_KEY_STOP = "<f8>"
+
+
+# ---------------------------------------------------------------------------
+# Key name helpers
+# ---------------------------------------------------------------------------
+
+# tkinter keysym → pynput GlobalHotKeys format
+_KEYSYM_TO_PYNPUT: dict[str, str] = {
+    "space": "<space>", "Return": "<enter>", "Tab": "<tab>",
+    "BackSpace": "<backspace>", "Delete": "<delete>",
+    "Escape": "<esc>", "Insert": "<insert>",
+    "Home": "<home>", "End": "<end>",
+    "Prior": "<page_up>", "Next": "<page_down>",
+    "Up": "<up>", "Down": "<down>", "Left": "<left>", "Right": "<right>",
+    "Print": "<print_screen>", "Pause": "<pause>", "Scroll_Lock": "<scroll_lock>",
+    "Num_Lock": "<num_lock>", "Caps_Lock": "<caps_lock>",
+    **{f"F{i}": f"<f{i}>" for i in range(1, 13)},
+}
+
+
+def keysym_to_pynput(keysym: str) -> str | None:
+    """Convert a tkinter keysym to a pynput GlobalHotKeys key string."""
+    if keysym in _KEYSYM_TO_PYNPUT:
+        return _KEYSYM_TO_PYNPUT[keysym]
+    if len(keysym) == 1 and keysym.isprintable():
+        return keysym.lower()
+    return None
+
+
+def pynput_to_display(key: str) -> str:
+    """Convert a pynput key string to a short display label."""
+    if key.startswith("<") and key.endswith(">"):
+        inner = key[1:-1]
+        # e.g. f6 → F6, page_up → Page Up
+        return inner.replace("_", " ").title()
+    return key.upper()
+
+
+# ---------------------------------------------------------------------------
+# Portal backend
+# ---------------------------------------------------------------------------
+
+class PortalBackend:
+    def __init__(self):
+        DBusGMainLoop(set_as_default=True)
+        self._bus = dbus.SessionBus()
+        self._glib_loop = GLib.MainLoop()
+        threading.Thread(target=self._glib_loop.run, daemon=True).start()
+
+        portal_obj = self._bus.get_object(PORTAL_BUS, PORTAL_PATH)
+        self._iface = dbus.Interface(portal_obj, PORTAL_RD)
+
+        self._session_handle: str | None = None
+        self._ready = threading.Event()
+        self._counter = 0
+        self._sender = self._bus.get_unique_name()[1:].replace(".", "_")
+
+    def _token(self) -> str:
+        self._counter += 1
+        return f"wayclicker_{self._counter}"
+
+    def _req_path(self, token: str) -> str:
+        return f"/org/freedesktop/portal/desktop/request/{self._sender}/{token}"
+
+    def _on_response(self, token: str, callback):
+        path = self._req_path(token)
+        handle = []
+
+        def _handler(response, results):
+            for h in handle:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+            callback(int(response), dict(results))
+
+        handle.append(self._bus.add_signal_receiver(
+            _handler, signal_name="Response",
+            dbus_interface=PORTAL_REQ, path=path,
+        ))
+
+    def setup(self, on_ready, on_deny):
+        self._on_ready = on_ready
+        self._on_deny = on_deny
+        self._create_session()
+
+    def _create_session(self):
+        session_tok = self._token()
+        req_tok = self._token()
+        self._on_response(req_tok, self._cb_create)
+        self._iface.CreateSession(dbus.Dictionary(
+            {"handle_token": dbus.String(req_tok),
+             "session_handle_token": dbus.String(session_tok)},
+            signature="sv",
+        ))
+
+    def _cb_create(self, response: int, results: dict):
+        if response != 0:
+            self._on_deny("Session creation was cancelled.")
+            return
+        self._session_handle = str(results["session_handle"])
+        self._select_devices()
+
+    def _select_devices(self):
+        req_tok = self._token()
+        self._on_response(req_tok, self._cb_select)
+        self._iface.SelectDevices(
+            dbus.ObjectPath(self._session_handle),
+            dbus.Dictionary(
+                {"handle_token": dbus.String(req_tok),
+                 "types": dbus.UInt32(DEVICE_POINTER)},
+                signature="sv",
+            ),
+        )
+
+    def _cb_select(self, response: int, results: dict):
+        if response != 0:
+            self._on_deny("Device selection was cancelled.")
+            return
+        self._start_session()
+
+    def _start_session(self):
+        req_tok = self._token()
+        self._on_response(req_tok, self._cb_start)
+        self._iface.Start(
+            dbus.ObjectPath(self._session_handle),
+            dbus.String(""),
+            dbus.Dictionary({"handle_token": dbus.String(req_tok)}, signature="sv"),
+        )
+
+    def _cb_start(self, response: int, results: dict):
+        if response != 0:
+            self._on_deny("Permission denied by user.")
+            return
+        self._ready.set()
+        self._on_ready()
+
+    def click(self, button_label: str) -> bool:
+        if not self._ready.is_set() or self._session_handle is None:
+            return False
+        btn = BTN.get(button_label, BTN["Left"])
+        result: dict = {"ok": False}
+        done = threading.Event()
+
+        def _do_click():
+            opts = dbus.Dictionary({}, signature="sv")
+            sess = dbus.ObjectPath(self._session_handle)
+            try:
+                self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(1))
+                self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(0))
+                result["ok"] = True
+            except Exception as ex:
+                print(f"[way-clicker] NotifyPointerButton error: {ex}", flush=True)
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(_do_click)
+        done.wait(timeout=2.0)
+        return result["ok"]
+
+    def cleanup(self):
+        if self._session_handle:
+            try:
+                obj = self._bus.get_object(PORTAL_BUS, self._session_handle)
+                dbus.Interface(obj, PORTAL_SESSION).Close()
+            except Exception:
+                pass
+        if self._glib_loop.is_running():
+            self._glib_loop.quit()
+
+
+# ---------------------------------------------------------------------------
+# Clicker engine
+# ---------------------------------------------------------------------------
+
+class ClickerEngine:
+    def __init__(self, backend: PortalBackend):
+        self._backend = backend
+        self._stop_event = threading.Event()
+
+    def start(self, interval_ms: int, button_label: str,
+              max_clicks: int, on_tick, on_done):
+        self._stop_event.clear()
+        threading.Thread(
+            target=self._loop,
+            args=(interval_ms, button_label, max_clicks, on_tick, on_done),
+            daemon=True,
+        ).start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _loop(self, interval_ms, button_label, max_clicks, on_tick, on_done):
+        interval = interval_ms / 1000.0
+        count = 0
+        infinite = max_clicks == 0
+        consecutive_errors = 0
+
+        while not self._stop_event.is_set():
+            if self._backend.click(button_label):
+                consecutive_errors = 0
+                count += 1
+                on_tick(count)
+                if not infinite and count >= max_clicks:
+                    break
+            else:
+                consecutive_errors += 1
+                if consecutive_errors >= 3:
+                    on_done(error=True)
+                    return
+
+            deadline = time.monotonic() + interval
+            while time.monotonic() < deadline and not self._stop_event.is_set():
+                time.sleep(0.02)
+
+        on_done(error=False)
+
+    def cleanup(self):
+        self.stop()
+        self._backend.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# Hotkey listener  (restartable with new key bindings)
+# ---------------------------------------------------------------------------
+
+class HotkeyListener:
+    def __init__(self):
+        self._listener = None
+        self._callbacks: dict[str, callable] = {}
+
+    def start(self, key_map: dict[str, callable]) -> bool:
+        """Start (or restart) with a new key_map {pynput_key: callback}."""
+        self.stop()
+        if not HAS_PYNPUT or not key_map:
+            return False
+        self._callbacks = key_map
+        try:
+            self._listener = pynput_keyboard.GlobalHotKeys(key_map)
+            self._listener.daemon = True
+            self._listener.start()
+            return True
+        except Exception as ex:
+            print(f"[way-clicker] hotkey error: {ex}", flush=True)
+            return False
+
+    def stop(self):
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+
+# ---------------------------------------------------------------------------
+# Key-capture dialog
+# ---------------------------------------------------------------------------
+
+class KeyCaptureDialog(tk.Toplevel):
+    """
+    Modal dialog that waits for the user to press a key.
+    Sets self.result to the pynput key string, or None if cancelled.
+    """
+
+    def __init__(self, parent: tk.Tk, title: str):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.configure(bg=COLOR_BG)
+        self.transient(parent)
+        self.grab_set()
+        self.result: str | None = None
+
+        tk.Label(self, text="⌨", bg=COLOR_BG, fg=COLOR_ACCENT,
+                 font=("Sans", 28)).pack(pady=(16, 4))
+        tk.Label(self, text="Press a key to assign…",
+                 bg=COLOR_BG, fg=COLOR_TEXT, font=("Sans", 12)).pack()
+        tk.Label(self, text="Esc to cancel",
+                 bg=COLOR_BG, fg=COLOR_MUTED, font=("Sans", 9)).pack(pady=(4, 16))
+
+        self.bind("<Key>", self._on_key)
+        self.focus_set()
+        self.wait_window()
+
+    def _on_key(self, event: tk.Event):
+        if event.keysym == "Escape":
+            self.destroy()
+            return
+        pynput_key = keysym_to_pynput(event.keysym)
+        if pynput_key:
+            self.result = pynput_key
+            self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class WayClickerApp:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Way Clicker")
+        self.root.resizable(False, False)
+        self.root.configure(bg=COLOR_BG)
+
+        self._backend = PortalBackend()
+        self._engine = ClickerEngine(self._backend)
+        self._hotkeys = HotkeyListener()
+        self._running = False
+        self._ready = False
+
+        # Current hotkey bindings (pynput format)
+        self._key_toggle = DEFAULT_KEY_TOGGLE
+        self._key_stop = DEFAULT_KEY_STOP
+
+        self._build_ui()
+        self._apply_hotkeys()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(200, self._init_portal)
+
+    # ──────────────────────────────────────────────────────────── build UI
+
+    def _build_ui(self):
+        root = self.root
+
+        tk.Label(root, text="Way Clicker", bg=COLOR_BG, fg=COLOR_TEXT,
+                 font=("Sans", 16, "bold")).pack(pady=(14, 2))
+        tk.Label(root, text="Wayland Auto Clicker", bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=("Sans", 9)).pack(pady=(0, 10))
+
+        # Status bar
+        sf = tk.Frame(root, bg=COLOR_SURFACE,
+                      highlightbackground=COLOR_BORDER, highlightthickness=1)
+        sf.pack(fill="x", padx=12, pady=(0, 8))
+        self._status_label = tk.Label(
+            sf, text="● Waiting for permission…", bg=COLOR_SURFACE,
+            fg=COLOR_INFO, font=("Mono", 9), anchor="w")
+        self._status_label.pack(side="left", padx=8, pady=4)
+        self._count_label = tk.Label(
+            sf, text="", bg=COLOR_SURFACE, fg=COLOR_MUTED,
+            font=("Mono", 9), anchor="e")
+        self._count_label.pack(side="right", padx=8, pady=4)
+
+        # Interval
+        self._section("Click Interval", root)
+        ifr = tk.Frame(root, bg=COLOR_BG)
+        ifr.pack(padx=12, pady=(0, 6), fill="x")
+        self._hours = self._spinbox(ifr, "Hrs", 0, 23)
+        self._minutes = self._spinbox(ifr, "Min", 0, 59)
+        self._seconds = self._spinbox(ifr, "Sec", 0, 59)
+        self._millis = self._spinbox(ifr, "Ms", 0, 999, default=100)
+        for w in ifr.winfo_children():
+            w.pack(side="left", padx=4)
+
+        # Mouse button
+        self._section("Mouse Button", root)
+        bfr = tk.Frame(root, bg=COLOR_BG)
+        bfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._button_var = tk.StringVar(value="Left")
+        for label in ("Left", "Middle", "Right"):
+            tk.Radiobutton(
+                bfr, text=label, variable=self._button_var, value=label,
+                bg=COLOR_BG, fg=COLOR_TEXT, selectcolor=COLOR_SURFACE,
+                activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
+                font=("Sans", 10),
+            ).pack(side="left", padx=6)
+
+        # Click options
+        self._section("Click Options", root)
+        rfr = tk.Frame(root, bg=COLOR_BG)
+        rfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._infinite_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            rfr, text="Repeat until stopped",
+            variable=self._infinite_var, command=self._on_infinite_toggle,
+            bg=COLOR_BG, fg=COLOR_TEXT, selectcolor=COLOR_SURFACE,
+            activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
+            font=("Sans", 10),
+        ).pack(side="left")
+        cfr = tk.Frame(rfr, bg=COLOR_BG)
+        cfr.pack(side="left", padx=(16, 0))
+        tk.Label(cfr, text="Count:", bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=("Sans", 9)).pack(side="left")
+        self._count_var = tk.StringVar(value="10")
+        self._count_spin = tk.Spinbox(
+            cfr, from_=1, to=999999, textvariable=self._count_var,
+            width=7, state="disabled", bg=COLOR_SURFACE, fg=COLOR_TEXT,
+            buttonbackground=COLOR_SURFACE, relief="flat",
+            highlightbackground=COLOR_BORDER, highlightthickness=1,
+            font=("Mono", 10),
+        )
+        self._count_spin.pack(side="left", padx=4)
+
+        # Hotkeys
+        self._section("Hotkeys", root)
+        hkf = tk.Frame(root, bg=COLOR_BG)
+        hkf.pack(padx=12, pady=(0, 6), fill="x")
+
+        self._toggle_key_btn, self._toggle_key_lbl = self._hotkey_row(
+            hkf, "Start / Stop", self._key_toggle,
+            lambda: self._change_key("toggle"),
+        )
+        self._stop_key_btn, self._stop_key_lbl = self._hotkey_row(
+            hkf, "Stop only", self._key_stop,
+            lambda: self._change_key("stop"),
+        )
+
+        # Control button
+        cfr2 = tk.Frame(root, bg=COLOR_BG)
+        cfr2.pack(padx=12, pady=10, fill="x")
+        self._start_btn = tk.Button(
+            cfr2, text=self._start_btn_label(), command=self._toggle,
+            bg=COLOR_START, fg="white",
+            activebackground=COLOR_START_HOVER, activeforeground="white",
+            font=("Sans", 12, "bold"), relief="flat", bd=0,
+            padx=20, pady=10, cursor="hand2", state="disabled",
+        )
+        self._start_btn.pack(fill="x")
+
+    def _hotkey_row(self, parent, label: str, key: str, on_change) -> tuple:
+        row = tk.Frame(parent, bg=COLOR_BG)
+        row.pack(fill="x", pady=2)
+
+        tk.Label(row, text=label, bg=COLOR_BG, fg=COLOR_TEXT,
+                 font=("Sans", 10), width=13, anchor="w").pack(side="left")
+
+        key_lbl = tk.Label(row, text=pynput_to_display(key),
+                           bg=COLOR_SURFACE, fg=COLOR_INFO,
+                           font=("Mono", 10), width=10,
+                           highlightbackground=COLOR_BORDER, highlightthickness=1)
+        key_lbl.pack(side="left", padx=(0, 6))
+
+        btn = tk.Button(
+            row, text="Change", command=on_change,
+            bg=COLOR_SURFACE, fg=COLOR_MUTED,
+            activebackground=COLOR_BORDER, activeforeground=COLOR_TEXT,
+            font=("Sans", 9), relief="flat", padx=8, pady=2, cursor="hand2",
+        )
+        btn.pack(side="left")
+        return btn, key_lbl
+
+    def _section(self, title, parent):
+        f = tk.Frame(parent, bg=COLOR_BG)
+        f.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(f, text=title.upper(), bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=("Sans", 8, "bold")).pack(side="left")
+        tk.Frame(f, bg=COLOR_BORDER, height=1).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+
+    def _spinbox(self, parent, label, from_, to, default=0):
+        frame = tk.Frame(parent, bg=COLOR_BG)
+        tk.Label(frame, text=label, bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=("Sans", 8)).pack()
+        var = tk.StringVar(value=str(default))
+        tk.Spinbox(
+            frame, from_=from_, to=to, textvariable=var, width=4,
+            bg=COLOR_SURFACE, fg=COLOR_TEXT, buttonbackground=COLOR_SURFACE,
+            relief="flat", highlightbackground=COLOR_BORDER,
+            highlightthickness=1, font=("Mono", 11),
+        ).pack()
+        frame._var = var
+        return frame
+
+    # ──────────────────────────────────────────────── hotkey management
+
+    def _apply_hotkeys(self):
+        """(Re)start the global hotkey listener with current bindings."""
+        if not HAS_PYNPUT:
+            return
+        self._hotkeys.start({
+            self._key_toggle: lambda: self.root.after(0, self._toggle),
+            self._key_stop: lambda: self.root.after(0, self._stop),
+        })
+
+    def _change_key(self, which: str):
+        """Open the key-capture dialog and apply the new binding."""
+        title = "Set Start/Stop key" if which == "toggle" else "Set Stop key"
+        dlg = KeyCaptureDialog(self.root, title)
+        new_key = dlg.result
+        if new_key is None:
+            return
+
+        if which == "toggle":
+            self._key_toggle = new_key
+            self._toggle_key_lbl.config(text=pynput_to_display(new_key))
+        else:
+            self._key_stop = new_key
+            self._stop_key_lbl.config(text=pynput_to_display(new_key))
+
+        # Update button text and restart listener
+        self._start_btn.config(text=self._start_btn_label())
+        self._apply_hotkeys()
+
+    def _start_btn_label(self) -> str:
+        return f"Start  ({pynput_to_display(self._key_toggle)})"
+
+    # ──────────────────────────────────────────────── portal setup
+
+    def _init_portal(self):
+        self._backend.setup(
+            on_ready=lambda: self.root.after(0, self._portal_ready_ui),
+            on_deny=lambda r: self.root.after(0, lambda: self._portal_denied_ui(r)),
+        )
+
+    def _portal_ready_ui(self):
+        self._ready = True
+        self._status_label.config(text="● Ready", fg=COLOR_START)
+        self._start_btn.config(state="normal")
+
+    def _portal_denied_ui(self, reason: str):
+        self._status_label.config(text=f"● {reason}", fg=COLOR_STOP)
+        messagebox.showwarning("Permission denied", reason)
+
+    # ──────────────────────────────────────────────── helpers
+
+    def _get_interval_ms(self) -> int:
+        def v(frame):
+            try:
+                return max(0, int(frame._var.get()))
+            except ValueError:
+                return 0
+
+        total = (v(self._hours) * 3_600_000 +
+                 v(self._minutes) * 60_000 +
+                 v(self._seconds) * 1_000 +
+                 v(self._millis))
+        return max(1, total)
+
+    def _get_max_clicks(self) -> int:
+        if self._infinite_var.get():
+            return 0
+        try:
+            return max(1, int(self._count_var.get()))
+        except ValueError:
+            return 1
+
+    def _on_infinite_toggle(self):
+        state = "disabled" if self._infinite_var.get() else "normal"
+        self._count_spin.config(state=state)
+
+    def _set_running(self, running: bool):
+        self._running = running
+        if running:
+            stop_lbl = pynput_to_display(self._key_toggle)
+            self._start_btn.config(
+                text=f"Stop  ({stop_lbl})", bg=COLOR_STOP,
+                activebackground=COLOR_STOP_HOVER)
+            self._status_label.config(text="● Running", fg=COLOR_START)
+        else:
+            self._start_btn.config(
+                text=self._start_btn_label(), bg=COLOR_START,
+                activebackground=COLOR_START_HOVER)
+            self._status_label.config(text="● Ready", fg=COLOR_MUTED)
+            self._count_label.config(text="")
+
+    # ──────────────────────────────────────────────── clicker
+
+    def _toggle(self):
+        if self._running:
+            self._stop()
+        elif self._ready:
+            self._start()
+
+    def _start(self):
+        if self._running:
+            return
+        self._set_running(True)
+        self._engine.start(
+            interval_ms=self._get_interval_ms(),
+            button_label=self._button_var.get(),
+            max_clicks=self._get_max_clicks(),
+            on_tick=self._on_tick,
+            on_done=self._on_done,
+        )
+
+    def _stop(self):
+        self._engine.stop()
+
+    def _on_tick(self, count: int):
+        self.root.after(0, self._count_label.config, {"text": f"{count} clicks"})
+
+    def _on_done(self, error: bool):
+        def _update():
+            self._set_running(False)
+            if error:
+                self._status_label.config(text="● Click failed", fg=COLOR_STOP)
+                messagebox.showerror(
+                    "Click failed",
+                    "Failed to send click event via the RemoteDesktop portal.\n\n"
+                    "Check the terminal for the exact error.\n\n"
+                    "The portal session may have been closed by the compositor.",
+                )
+        self.root.after(0, _update)
+
+    def _on_close(self):
+        self._engine.cleanup()
+        self._hotkeys.stop()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app = WayClickerApp()
+    app.run()

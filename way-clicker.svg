@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#1e1e2e"/>
+  <!-- mouse body -->
+  <path d="M32 10C21 10 17 18 17 28v14c0 10 4 12 15 12 11 0 15-2 15-12V28C47 18 43 10 32 10z"
+        fill="none" stroke="#cdd6f4" stroke-width="2.5"/>
+  <!-- centre split -->
+  <line x1="32" y1="10" x2="32" y2="33" stroke="#cdd6f4" stroke-width="2"/>
+  <!-- left button (lit = clicking) -->
+  <path d="M18 28C18 18 22 11 32 11v22H18z" fill="#2ecc71" opacity="0.85"/>
+  <!-- scroll wheel -->
+  <rect x="28.5" y="17" width="7" height="13" rx="3.5"
+        fill="#1e1e2e" stroke="#cdd6f4" stroke-width="1.5"/>
+</svg>
