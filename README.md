@@ -26,7 +26,6 @@ To update, overwrite the file with the new release.
 - Configurable click interval (hours / minutes / seconds / ms)
 - **Random jitter** — ±N ms randomised per-click interval
 - Left, right, or middle mouse button
-- **Fixed click position** — lock clicks to specific X/Y screen coordinates
 - Fixed click count or repeat until stopped
 - **Start delay** — configurable countdown before clicking starts (button only; F6 is instant)
 - Global hotkeys: configurable in-app (defaults: **F6** start/stop · **F8** stop)
