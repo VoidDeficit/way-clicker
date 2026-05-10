@@ -5,8 +5,8 @@ script:
   # app code
   - mkdir -p AppDir/usr/local/lib/way-clicker
   - cp main.py AppDir/usr/local/lib/way-clicker/main.py
-  # install pynput into the AppDir's Python path
-  - pip3 install --target AppDir/usr/lib/python3/dist-packages pynput
+  # install Python deps into the AppDir's Python path
+  - pip3 install --target AppDir/usr/lib/python3/dist-packages pynput pystray Pillow
   # symlinks so Tcl finds its scripts at the paths it searches inside the AppDir
   - mkdir -p AppDir/usr/lib
   - ln -sf ../share/tcltk/tcl8.6 AppDir/usr/lib/tcl8.6
@@ -56,9 +56,12 @@ AppDir:
       - python3-tk
       - python3-dbus
       - python3-gi
+      - python3-pil
       - gir1.2-glib-2.0
+      - gir1.2-appindicator3-0.1
       - libdbus-1-3
       - libglib2.0-0
+      - libappindicator3-1
       - tcl8.6
       - tk8.6
 

@@ -17,10 +17,16 @@ from gi.repository import GLib
 
 try:
     from pynput import keyboard as pynput_keyboard
-
     HAS_PYNPUT = True
 except ImportError:
     HAS_PYNPUT = False
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
 
 PORTAL_BUS = "org.freedesktop.portal.Desktop"
 PORTAL_PATH = "/org/freedesktop/portal/desktop"
@@ -45,7 +51,6 @@ COLOR_WARN = "#e5c07b"
 COLOR_INFO = "#89b4fa"
 COLOR_ACCENT = "#cba6f7"
 
-# Default hotkeys in pynput format
 DEFAULT_KEY_TOGGLE = "<f6>"
 DEFAULT_KEY_STOP = "<f8>"
 
@@ -54,7 +59,6 @@ DEFAULT_KEY_STOP = "<f8>"
 # Key name helpers
 # ---------------------------------------------------------------------------
 
-# tkinter keysym → pynput GlobalHotKeys format
 _KEYSYM_TO_PYNPUT: dict[str, str] = {
     "space": "<space>", "Return": "<enter>", "Tab": "<tab>",
     "BackSpace": "<backspace>", "Delete": "<delete>",
@@ -69,7 +73,6 @@ _KEYSYM_TO_PYNPUT: dict[str, str] = {
 
 
 def keysym_to_pynput(keysym: str) -> str | None:
-    """Convert a tkinter keysym to a pynput GlobalHotKeys key string."""
     if keysym in _KEYSYM_TO_PYNPUT:
         return _KEYSYM_TO_PYNPUT[keysym]
     if len(keysym) == 1 and keysym.isprintable():
@@ -78,12 +81,28 @@ def keysym_to_pynput(keysym: str) -> str | None:
 
 
 def pynput_to_display(key: str) -> str:
-    """Convert a pynput key string to a short display label."""
     if key.startswith("<") and key.endswith(">"):
-        inner = key[1:-1]
-        # e.g. f6 → F6, page_up → Page Up
-        return inner.replace("_", " ").title()
+        return key[1:-1].replace("_", " ").title()
     return key.upper()
+
+
+# ---------------------------------------------------------------------------
+# Tray icon image
+# ---------------------------------------------------------------------------
+
+def _make_tray_image(size: int = 64) -> "Image.Image":
+    img = Image.new("RGBA", (size, size), (30, 30, 46, 255))
+    d = ImageDraw.Draw(img)
+    s = size
+    lw = max(1, s // 20)
+    # Mouse body
+    d.ellipse([s//6, s//8, s*5//6, s*7//8], outline=(205, 214, 244, 255), width=lw)
+    # Centre split
+    d.line([s//2, s//8, s//2, s//2], fill=(205, 214, 244, 255), width=max(1, s//32))
+    # Green left button
+    d.chord([s//6 + lw, s//8 + lw, s//2 - lw, s//2 + s//8], 180, 360,
+            fill=(46, 204, 113, 220))
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +204,8 @@ class PortalBackend:
         self._ready.set()
         self._on_ready()
 
-    def click(self, button_label: str) -> bool:
+    def click(self, button_label: str,
+              pos: tuple[int, int] | None = None) -> bool:
         if not self._ready.is_set() or self._session_handle is None:
             return False
         btn = BTN.get(button_label, BTN["Left"])
@@ -196,11 +216,16 @@ class PortalBackend:
             opts = dbus.Dictionary({}, signature="sv")
             sess = dbus.ObjectPath(self._session_handle)
             try:
+                if pos is not None:
+                    # stream=0 → absolute screen coordinates
+                    self._iface.NotifyPointerMotionAbsolute(
+                        sess, opts, dbus.UInt32(0),
+                        dbus.Double(pos[0]), dbus.Double(pos[1]))
                 self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(1))
                 self._iface.NotifyPointerButton(sess, opts, dbus.Int32(btn), dbus.UInt32(0))
                 result["ok"] = True
             except Exception as ex:
-                print(f"[way-clicker] NotifyPointerButton error: {ex}", flush=True)
+                print(f"[way-clicker] click error: {ex}", flush=True)
             finally:
                 done.set()
             return False
@@ -230,18 +255,22 @@ class ClickerEngine:
         self._stop_event = threading.Event()
 
     def start(self, interval_ms: int, button_label: str,
-              max_clicks: int, on_tick, on_done, jitter_ms: int = 0):
+              max_clicks: int, on_tick, on_done,
+              jitter_ms: int = 0,
+              fixed_pos: tuple[int, int] | None = None):
         self._stop_event.clear()
         threading.Thread(
             target=self._loop,
-            args=(interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done),
+            args=(interval_ms, jitter_ms, button_label, max_clicks,
+                  fixed_pos, on_tick, on_done),
             daemon=True,
         ).start()
 
     def stop(self):
         self._stop_event.set()
 
-    def _loop(self, interval_ms, jitter_ms, button_label, max_clicks, on_tick, on_done):
+    def _loop(self, interval_ms, jitter_ms, button_label, max_clicks,
+              fixed_pos, on_tick, on_done):
         interval = interval_ms / 1000.0
         jitter = jitter_ms / 1000.0
         count = 0
@@ -249,7 +278,7 @@ class ClickerEngine:
         consecutive_errors = 0
 
         while not self._stop_event.is_set():
-            if self._backend.click(button_label):
+            if self._backend.click(button_label, pos=fixed_pos):
                 consecutive_errors = 0
                 count += 1
                 on_tick(count)
@@ -274,20 +303,17 @@ class ClickerEngine:
 
 
 # ---------------------------------------------------------------------------
-# Hotkey listener  (restartable with new key bindings)
+# Hotkey listener
 # ---------------------------------------------------------------------------
 
 class HotkeyListener:
     def __init__(self):
         self._listener = None
-        self._callbacks: dict[str, callable] = {}
 
     def start(self, key_map: dict[str, callable]) -> bool:
-        """Start (or restart) with a new key_map {pynput_key: callback}."""
         self.stop()
         if not HAS_PYNPUT or not key_map:
             return False
-        self._callbacks = key_map
         try:
             self._listener = pynput_keyboard.GlobalHotKeys(key_map)
             self._listener.daemon = True
@@ -311,11 +337,6 @@ class HotkeyListener:
 # ---------------------------------------------------------------------------
 
 class KeyCaptureDialog(tk.Toplevel):
-    """
-    Modal dialog that waits for the user to press a key.
-    Sets self.result to the pynput key string, or None if cancelled.
-    """
-
     def __init__(self, parent: tk.Tk, title: str):
         super().__init__(parent)
         self.title(title)
@@ -363,14 +384,15 @@ class WayClickerApp:
         self._running = False
         self._ready = False
         self._delay_id = None
+        self._tray: "pystray.Icon | None" = None
 
-        # Current hotkey bindings (pynput format)
         self._key_toggle = DEFAULT_KEY_TOGGLE
         self._key_stop = DEFAULT_KEY_STOP
 
         self._build_ui()
         self._load_settings()
         self._apply_hotkeys()
+        self._setup_tray()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._init_portal)
 
@@ -454,11 +476,30 @@ class WayClickerApp:
         )
         self._count_spin.pack(side="left", padx=4)
 
+        # Fixed click position
+        self._section("Click Position", root)
+        pfr = tk.Frame(root, bg=COLOR_BG)
+        pfr.pack(padx=12, pady=(0, 6), fill="x")
+        self._fixed_pos_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            pfr, text="Fixed position",
+            variable=self._fixed_pos_var, command=self._on_fixed_pos_toggle,
+            bg=COLOR_BG, fg=COLOR_TEXT, selectcolor=COLOR_SURFACE,
+            activebackground=COLOR_BG, activeforeground=COLOR_TEXT,
+            font=("Sans", 10),
+        ).pack(side="left")
+        xyfr = tk.Frame(pfr, bg=COLOR_BG)
+        xyfr.pack(side="left", padx=(16, 0))
+        self._fixed_x = self._spinbox(xyfr, "X", 0, 9999, default=0)
+        self._fixed_x.pack(side="left", padx=4)
+        self._fixed_y = self._spinbox(xyfr, "Y", 0, 9999, default=0)
+        self._fixed_y.pack(side="left", padx=4)
+        self._on_fixed_pos_toggle()
+
         # Hotkeys
         self._section("Hotkeys", root)
         hkf = tk.Frame(root, bg=COLOR_BG)
         hkf.pack(padx=12, pady=(0, 6), fill="x")
-
         self._toggle_key_btn, self._toggle_key_lbl = self._hotkey_row(
             hkf, "Start / Stop", self._key_toggle,
             lambda: self._change_key("toggle"),
@@ -498,16 +539,13 @@ class WayClickerApp:
     def _hotkey_row(self, parent, label: str, key: str, on_change) -> tuple:
         row = tk.Frame(parent, bg=COLOR_BG)
         row.pack(fill="x", pady=2)
-
         tk.Label(row, text=label, bg=COLOR_BG, fg=COLOR_TEXT,
                  font=("Sans", 10), width=13, anchor="w").pack(side="left")
-
         key_lbl = tk.Label(row, text=pynput_to_display(key),
                            bg=COLOR_SURFACE, fg=COLOR_INFO,
                            font=("Mono", 10), width=10,
                            highlightbackground=COLOR_BORDER, highlightthickness=1)
         key_lbl.pack(side="left", padx=(0, 6))
-
         btn = tk.Button(
             row, text="Change", command=on_change,
             bg=COLOR_SURFACE, fg=COLOR_MUTED,
@@ -539,10 +577,40 @@ class WayClickerApp:
         frame._var = var
         return frame
 
+    # ──────────────────────────────────────────────── tray
+
+    def _setup_tray(self):
+        if not HAS_TRAY:
+            return
+        menu = pystray.Menu(
+            pystray.MenuItem("Show Way Clicker", self._show_window, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Start / Stop", lambda: self.root.after(0, self._toggle)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Quit", self._quit),
+        )
+        self._tray = pystray.Icon(
+            "way-clicker", _make_tray_image(), "Way Clicker", menu)
+        self._tray.run_detached()
+
+    def _show_window(self):
+        self.root.after(0, lambda: (
+            self.root.deiconify(),
+            self.root.lift(),
+            self.root.focus_force(),
+        ))
+
+    def _quit(self):
+        self._save_settings()
+        self._engine.cleanup()
+        self._hotkeys.stop()
+        if self._tray:
+            self._tray.stop()
+        self.root.after(0, self.root.destroy)
+
     # ──────────────────────────────────────────────── hotkey management
 
     def _apply_hotkeys(self):
-        """(Re)start the global hotkey listener with current bindings."""
         if not HAS_PYNPUT:
             return
         self._hotkeys.start({
@@ -551,21 +619,17 @@ class WayClickerApp:
         })
 
     def _change_key(self, which: str):
-        """Open the key-capture dialog and apply the new binding."""
         title = "Set Start/Stop key" if which == "toggle" else "Set Stop key"
         dlg = KeyCaptureDialog(self.root, title)
         new_key = dlg.result
         if new_key is None:
             return
-
         if which == "toggle":
             self._key_toggle = new_key
             self._toggle_key_lbl.config(text=pynput_to_display(new_key))
         else:
             self._key_stop = new_key
             self._stop_key_lbl.config(text=pynput_to_display(new_key))
-
-        # Update button text and restart listener
         self._start_btn.config(text=self._start_btn_label())
         self._apply_hotkeys()
 
@@ -597,7 +661,6 @@ class WayClickerApp:
                 return max(0, int(frame._var.get()))
             except ValueError:
                 return 0
-
         total = (v(self._hours) * 3_600_000 +
                  v(self._minutes) * 60_000 +
                  v(self._seconds) * 1_000 +
@@ -616,6 +679,15 @@ class WayClickerApp:
         except ValueError:
             return 0
 
+    def _get_fixed_pos(self) -> tuple[int, int] | None:
+        if not self._fixed_pos_var.get():
+            return None
+        try:
+            return (max(0, int(self._fixed_x._var.get())),
+                    max(0, int(self._fixed_y._var.get())))
+        except ValueError:
+            return None
+
     def _get_max_clicks(self) -> int:
         if self._infinite_var.get():
             return 0
@@ -628,25 +700,36 @@ class WayClickerApp:
         state = "disabled" if self._infinite_var.get() else "normal"
         self._count_spin.config(state=state)
 
+    def _on_fixed_pos_toggle(self):
+        state = "normal" if self._fixed_pos_var.get() else "disabled"
+        for spinbox_frame in (self._fixed_x, self._fixed_y):
+            for child in spinbox_frame.winfo_children():
+                try:
+                    child.config(state=state)
+                except tk.TclError:
+                    pass
+
     def _set_running(self, running: bool):
         self._running = running
         if running:
-            stop_lbl = pynput_to_display(self._key_toggle)
             self._start_btn.config(
-                text=f"Stop  ({stop_lbl})", bg=COLOR_STOP,
-                activebackground=COLOR_STOP_HOVER)
+                text=f"Stop  ({pynput_to_display(self._key_toggle)})",
+                bg=COLOR_STOP, activebackground=COLOR_STOP_HOVER)
             self._status_label.config(text="● Running", fg=COLOR_START)
+            if self._tray:
+                self._tray.title = "Way Clicker — Running"
         else:
             self._start_btn.config(
-                text=self._start_btn_label(), bg=COLOR_START,
-                activebackground=COLOR_START_HOVER)
+                text=self._start_btn_label(),
+                bg=COLOR_START, activebackground=COLOR_START_HOVER)
             self._status_label.config(text="● Ready", fg=COLOR_MUTED)
             self._count_label.config(text="")
+            if self._tray:
+                self._tray.title = "Way Clicker"
 
     # ──────────────────────────────────────────────── clicker
 
     def _toggle_btn(self):
-        """Called by the Start/Stop button — applies start delay."""
         if self._running:
             self._stop()
         elif self._delay_id is not None:
@@ -659,7 +742,6 @@ class WayClickerApp:
                 self._start()
 
     def _toggle(self):
-        """Called by hotkey — no delay."""
         if self._running:
             self._stop()
         elif self._delay_id is not None:
@@ -678,8 +760,7 @@ class WayClickerApp:
             self._start_btn.config(bg=COLOR_START, activebackground=COLOR_START_HOVER)
             self._start()
             return
-        self._delay_id = self.root.after(
-            100, self._start_delayed, remaining_ms - 100)
+        self._delay_id = self.root.after(100, self._start_delayed, remaining_ms - 100)
 
     def _cancel_delay(self):
         if self._delay_id is not None:
@@ -701,6 +782,7 @@ class WayClickerApp:
             on_tick=self._on_tick,
             on_done=self._on_done,
             jitter_ms=self._get_jitter_ms(),
+            fixed_pos=self._get_fixed_pos(),
         )
 
     def _stop(self):
@@ -725,6 +807,8 @@ class WayClickerApp:
                 )
         self.root.after(0, _update)
 
+    # ──────────────────────────────────────────────── settings
+
     def _load_settings(self):
         try:
             with open(CONFIG_PATH) as f:
@@ -741,6 +825,10 @@ class WayClickerApp:
         self._infinite_var.set(s.get("infinite", True))
         self._count_var.set(str(s.get("count", 10)))
         self._on_infinite_toggle()
+        self._fixed_pos_var.set(s.get("fixed", False))
+        self._fixed_x._var.set(str(s.get("fixed_x", 0)))
+        self._fixed_y._var.set(str(s.get("fixed_y", 0)))
+        self._on_fixed_pos_toggle()
         self._key_toggle = s.get("key_toggle", DEFAULT_KEY_TOGGLE)
         self._key_stop = s.get("key_stop", DEFAULT_KEY_STOP)
         self._toggle_key_lbl.config(text=pynput_to_display(self._key_toggle))
@@ -758,6 +846,9 @@ class WayClickerApp:
             "button": self._button_var.get(),
             "infinite": self._infinite_var.get(),
             "count": self._count_var.get(),
+            "fixed": self._fixed_pos_var.get(),
+            "fixed_x": self._fixed_x._var.get(),
+            "fixed_y": self._fixed_y._var.get(),
             "key_toggle": self._key_toggle,
             "key_stop": self._key_stop,
         }
@@ -769,10 +860,11 @@ class WayClickerApp:
             print(f"[way-clicker] could not save settings: {ex}", flush=True)
 
     def _on_close(self):
-        self._save_settings()
-        self._engine.cleanup()
-        self._hotkeys.stop()
-        self.root.destroy()
+        if self._tray:
+            self._save_settings()
+            self.root.withdraw()
+        else:
+            self._quit()
 
     def run(self):
         self.root.mainloop()
