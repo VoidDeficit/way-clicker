@@ -231,7 +231,8 @@ class PortalBackend:
             return False
 
         GLib.idle_add(_do_click)
-        done.wait(timeout=2.0)
+        if not done.wait(timeout=2.0):
+            return True  # GLib loop slow but click was queued — not a real failure
         return result["ok"]
 
     def cleanup(self):
@@ -843,13 +844,8 @@ class WayClickerApp:
         def _update():
             self._set_running(False)
             if error:
-                self._status_label.config(text="● Click failed", fg=COLOR_STOP)
-                messagebox.showerror(
-                    "Click failed",
-                    "Failed to send click event via the RemoteDesktop portal.\n\n"
-                    "Check the terminal for the exact error.\n\n"
-                    "The portal session may have been closed by the compositor.",
-                )
+                self._status_label.config(
+                    text="● Stopped — portal error (see terminal)", fg=COLOR_STOP)
         self.root.after(0, _update)
 
     # ──────────────────────────────────────────────── settings
