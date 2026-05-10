@@ -71,4 +71,3 @@ AppImage:
   arch: x86_64
   update-information: None
   sign-key: None
-  version: !ENV '${APP_VERSION:-dev}'
