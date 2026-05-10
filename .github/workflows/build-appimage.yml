@@ -56,17 +56,26 @@ jobs:
         run: |
           find . -maxdepth 1 -name "*.AppImage" | head -1 | xargs -I{} mv {} Way-Clicker-x86_64.AppImage
 
+      - name: Generate zsync
+        run: |
+          sudo apt-get install -y --no-install-recommends zsync
+          zsyncmake Way-Clicker-x86_64.AppImage
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Way-Clicker-x86_64
-          path: '*.AppImage'
+          path: |
+            *.AppImage
+            *.AppImage.zsync
           if-no-files-found: error
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: '*.AppImage'
+          files: |
+            *.AppImage
+            *.AppImage.zsync
           generate_release_notes: true
           fail_on_unmatched_files: true

@@ -494,6 +494,13 @@ class WayClickerApp:
         self._fixed_x.pack(side="left", padx=4)
         self._fixed_y = self._spinbox(xyfr, "Y", 0, 9999, default=0)
         self._fixed_y.pack(side="left", padx=4)
+        self._pick_btn = tk.Button(
+            xyfr, text="Pick", command=self._pick_position,
+            bg=COLOR_SURFACE, fg=COLOR_MUTED,
+            activebackground=COLOR_BORDER, activeforeground=COLOR_TEXT,
+            font=("Sans", 9), relief="flat", padx=8, pady=2, cursor="hand2",
+        )
+        self._pick_btn.pack(side="left", padx=(8, 0))
         self._on_fixed_pos_toggle()
 
         # Hotkeys
@@ -708,6 +715,44 @@ class WayClickerApp:
                     child.config(state=state)
                 except tk.TclError:
                     pass
+        self._pick_btn.config(state=state)
+
+    def _pick_position(self):
+        """Wait for any key press, then capture the current cursor coordinates."""
+        if not HAS_PYNPUT:
+            return
+        self._pick_btn.config(state="disabled", text="…press a key")
+        self._status_label.config(
+            text="● Move cursor to target, then press any key…", fg=COLOR_WARN)
+        self._hotkeys.stop()
+
+        from pynput.mouse import Controller as MouseCtrl
+        from pynput import keyboard as kb
+
+        def on_press(key):
+            try:
+                x, y = MouseCtrl().position
+                self.root.after(0, lambda: self._set_picked_pos(int(x), int(y)))
+            except Exception as ex:
+                print(f"[way-clicker] pick error: {ex}", flush=True)
+                self.root.after(0, self._pick_done)
+            return False  # stop listener after first key
+
+        listener = kb.Listener(on_press=on_press)
+        listener.daemon = True
+        listener.start()
+
+    def _set_picked_pos(self, x: int, y: int):
+        self._fixed_x._var.set(str(x))
+        self._fixed_y._var.set(str(y))
+        self._pick_done()
+
+    def _pick_done(self):
+        self._pick_btn.config(state="normal", text="Pick")
+        ready_text = "● Ready" if self._ready else "● Waiting for permission…"
+        ready_color = COLOR_START if self._ready else COLOR_INFO
+        self._status_label.config(text=ready_text, fg=ready_color)
+        self._apply_hotkeys()
 
     def _set_running(self, running: bool):
         self._running = running

@@ -28,6 +28,26 @@ script:
     Type=Application
     Categories=Utility;
     EOF
+  # AppStream metainfo (Shelly and other managers read this for repo/update info)
+  - mkdir -p AppDir/usr/share/metainfo
+  - |
+    cat > AppDir/usr/share/metainfo/io.github.way-clicker.appdata.xml << EOF
+    <?xml version="1.0" encoding="UTF-8"?>
+    <component type="desktop-application">
+      <id>io.github.way-clicker</id>
+      <metadata_license>MIT</metadata_license>
+      <project_license>MIT</project_license>
+      <name>Way Clicker</name>
+      <summary>Wayland auto clicker</summary>
+      <description><p>Lightweight Wayland auto clicker via the XDG RemoteDesktop portal.</p></description>
+      <url type="homepage">https://github.com/VoidDeficit/way-clicker</url>
+      <url type="bugtracker">https://github.com/VoidDeficit/way-clicker/issues</url>
+      <url type="vcs-browser">https://github.com/VoidDeficit/way-clicker</url>
+      <releases>
+        <release version="${APP_VERSION}" date="$(date -u +%Y-%m-%d)"/>
+      </releases>
+    </component>
+    EOF
 
 AppDir:
   path: ./AppDir
@@ -83,5 +103,5 @@ AppDir:
 
 AppImage:
   arch: x86_64
-  update-information: None
+  update-information: 'gh-releases-zsync|VoidDeficit|way-clicker|latest|Way-Clicker-x86_64.AppImage.zsync'
   sign-key: None
